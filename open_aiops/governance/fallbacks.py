@@ -21,17 +21,17 @@ from open_aiops.governance.router import (
 T = TypeVar("T")
 
 
-class RateLimitError(Exception):
-    """Raised by a provider call when the provider answers HTTP 429."""
-
-    def __init__(self, retry_after: float | None = None):
-        super().__init__("rate limited")
-        self.retry_after = retry_after
-
+from open_aiops.providers.errors import (
+    ProviderTimeout,
+    ProviderUnavailable,
+    RateLimitError,
+)
 
 # asyncio.TimeoutError is only an alias of TimeoutError from Python 3.11.
 FAILOVER_ERRORS: tuple[type[BaseException], ...] = (
     RateLimitError,
+    ProviderTimeout,
+    ProviderUnavailable,
     TimeoutError,
     asyncio.TimeoutError,
     ConnectionError,
