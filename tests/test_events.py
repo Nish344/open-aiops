@@ -1,8 +1,10 @@
 import logging
+from decimal import Decimal
 
 import pytest
 
 from open_aiops.events import (
+    DEFAULT_SUBSCRIBER_BUDGET_S,
     AttemptFailed,
     AttemptStarted,
     AttemptSucceeded,
@@ -43,8 +45,15 @@ def golden_ok_path():
             latency_s=0.2,
             input_tokens=10,
             output_tokens=20,
+            cost=Decimal("0.01"),
+            cost_status="priced",
         ),
-        RequestCompleted(request_id=REQ, latency_s=0.25, cost=0.01),
+        RequestCompleted(
+            request_id=REQ,
+            latency_s=0.25,
+            total_cost=Decimal("0.01"),
+            cost_complete=True,
+        ),
     ]
 
 
@@ -52,6 +61,10 @@ def test_events_are_immutable():
     event = RequestStarted(request_id=REQ)
     with pytest.raises(Exception):
         event.request_id = "other"  # type: ignore[misc]
+
+
+def test_default_subscriber_budget_is_five_ms():
+    assert DEFAULT_SUBSCRIBER_BUDGET_S == 0.005
 
 
 def test_assert_well_formed_accepts_golden_path():
@@ -72,6 +85,8 @@ def test_assert_well_formed_accepts_failover_path():
             provider="a",
             model="m",
             error_type="RateLimitError",
+            retryable=True,
+            failover_eligible=True,
         ),
         RetryScheduled(
             request_id=REQ,
@@ -92,6 +107,8 @@ def test_assert_well_formed_accepts_failover_path():
             provider="a",
             model="m",
             error_type="RateLimitError",
+            retryable=True,
+            failover_eligible=True,
         ),
         FallbackTriggered(
             request_id=REQ,
@@ -110,8 +127,15 @@ def test_assert_well_formed_accepts_failover_path():
             provider="b",
             model="m",
             latency_s=0.1,
+            cost=Decimal("0.0043"),
+            cost_status="priced",
         ),
-        RequestCompleted(request_id=REQ, latency_s=0.5),
+        RequestCompleted(
+            request_id=REQ,
+            latency_s=0.5,
+            total_cost=Decimal("0.0043"),
+            cost_complete=True,
+        ),
     ]
     assert_well_formed(events)
 
@@ -155,6 +179,31 @@ def test_assert_well_formed_rejects_open_attempt_at_request_end():
         )
 
 
+def test_assert_well_formed_rejects_attempt_number_skip():
+    with pytest.raises(MalformedEventSequence, match="attempt_number"):
+        assert_well_formed(
+            [
+                RequestStarted(request_id=REQ),
+                AttemptStarted(
+                    request_id=REQ,
+                    attempt_id=ATT,
+                    attempt_number=2,
+                    provider="p",
+                    model="m",
+                ),
+                AttemptSucceeded(
+                    request_id=REQ,
+                    attempt_id=ATT,
+                    attempt_number=2,
+                    provider="p",
+                    model="m",
+                    latency_s=0.1,
+                ),
+                RequestCompleted(request_id=REQ, latency_s=0.1),
+            ]
+        )
+
+
 def test_assert_well_formed_streaming_path():
     events = [
         RequestStarted(request_id=REQ),
@@ -171,8 +220,10 @@ def test_assert_well_formed_streaming_path():
             provider="p",
             model="m",
             latency_s=1.0,
+            cost=None,
+            cost_status="missing_usage",
         ),
-        RequestCompleted(request_id=REQ, latency_s=1.0),
+        RequestCompleted(request_id=REQ, latency_s=1.0, cost_complete=False),
     ]
     assert_well_formed(events)
 
@@ -225,7 +276,7 @@ def test_dispatcher_warns_when_subscriber_exceeds_budget(caplog):
 
     dispatcher = EventDispatcher(
         [slow],
-        subscriber_budget_s=0.05,
+        subscriber_budget_s=DEFAULT_SUBSCRIBER_BUDGET_S,
         clock=lambda: next(ticks),
     )
     with caplog.at_level(logging.WARNING):
@@ -238,7 +289,7 @@ def test_new_id_is_opaque_unique():
     assert len(new_id()) >= 32
 
 
-def test_failed_events_carry_error_type_only():
+def test_failed_events_carry_error_type_and_flags_only():
     event = AttemptFailed(
         request_id=REQ,
         attempt_id=ATT,
@@ -246,8 +297,34 @@ def test_failed_events_carry_error_type_only():
         provider="p",
         model="m",
         error_type="TimeoutError",
+        retryable=True,
+        failover_eligible=True,
     )
     dumped = event.model_dump()
-    assert set(dumped) >= {"type", "error_type", "request_id", "attempt_id"}
-    assert "message" not in dumped
     assert dumped["error_type"] == "TimeoutError"
+    assert dumped["retryable"] is True
+    assert dumped["failover_eligible"] is True
+    assert "message" not in dumped
+
+
+def test_cost_fields_use_decimal():
+    succeeded = AttemptSucceeded(
+        request_id=REQ,
+        attempt_id=ATT,
+        attempt_number=1,
+        provider="p",
+        model="m",
+        latency_s=0.1,
+        cost=Decimal("0.0043"),
+        cost_status="priced",
+    )
+    completed = RequestCompleted(
+        request_id=REQ,
+        latency_s=0.1,
+        total_cost=Decimal("0.0043"),
+        cost_complete=True,
+    )
+    assert isinstance(succeeded.cost, Decimal)
+    assert isinstance(completed.total_cost, Decimal)
+    assert succeeded.cost_status == "priced"
+    assert completed.cost_complete is True

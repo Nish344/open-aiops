@@ -11,6 +11,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Annotated, Literal, Union
 from uuid import uuid4
@@ -22,7 +23,10 @@ SCHEMA_VERSION = "1"
 logger = logging.getLogger(__name__)
 
 # Soft budget for a single subscriber call; overruns log a warning, not an error.
-DEFAULT_SUBSCRIBER_BUDGET_S = 0.05
+# 5 ms matches the architecture design value.
+DEFAULT_SUBSCRIBER_BUDGET_S = 0.005
+
+CostStatus = Literal["priced", "unknown_model", "missing_usage", "free"]
 
 
 def new_id() -> str:
@@ -57,8 +61,8 @@ class RequestStarted(EventBase):
 class RequestCompleted(EventBase):
     type: Literal["RequestCompleted"] = "RequestCompleted"
     latency_s: float = Field(ge=0)
-    # Cost is filled by a later ticket; keep the slot optional and numeric only.
-    cost: float | None = Field(default=None, ge=0)
+    total_cost: Decimal | None = Field(default=None, ge=0)
+    cost_complete: bool = False
 
 
 class RequestFailed(EventBase):
@@ -81,12 +85,15 @@ class AttemptSucceeded(AttemptEventBase):
     latency_s: float = Field(ge=0)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
-    cost: float | None = Field(default=None, ge=0)
+    cost: Decimal | None = Field(default=None, ge=0)
+    cost_status: CostStatus = "missing_usage"
 
 
 class AttemptFailed(AttemptEventBase):
     type: Literal["AttemptFailed"] = "AttemptFailed"
     error_type: str
+    retryable: bool
+    failover_eligible: bool
 
 
 class AttemptCancelled(AttemptEventBase):
@@ -102,7 +109,8 @@ class StreamCompleted(AttemptEventBase):
     latency_s: float = Field(ge=0)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
-    cost: float | None = Field(default=None, ge=0)
+    cost: Decimal | None = Field(default=None, ge=0)
+    cost_status: CostStatus = "missing_usage"
 
 
 class StreamInterrupted(AttemptEventBase):
@@ -231,9 +239,11 @@ def assert_well_formed(events: Sequence[LifecycleEvent]) -> None:
 
     Raises ``MalformedEventSequence`` on the first violation.
     ``CircuitStateChanged`` is ignored for request lifecycle checks.
+    ``attempt_number`` must start at 1 and increase by one on each AttemptStarted.
     """
     request_open = False
     request_done = False
+    next_attempt_number = 1
     # attempt_id -> {"streaming": bool|None, "done": bool, "had_first_chunk": bool}
     attempts: dict[str, dict[str, object]] = {}
 
@@ -266,14 +276,20 @@ def assert_well_formed(events: Sequence[LifecycleEvent]) -> None:
             continue
 
         if et == "AttemptStarted":
+            number = event.attempt_number  # type: ignore[union-attr]
+            if number != next_attempt_number:
+                raise MalformedEventSequence(
+                    f"attempt_number {number} out of order; expected {next_attempt_number}"
+                )
             if event.attempt_id in attempts:  # type: ignore[union-attr]
                 raise MalformedEventSequence(f"duplicate AttemptStarted {event.attempt_id}")  # type: ignore[union-attr]
             attempts[event.attempt_id] = {  # type: ignore[union-attr]
                 "streaming": None,
                 "done": False,
                 "had_first_chunk": False,
-                "number": event.attempt_number,  # type: ignore[union-attr]
+                "number": number,
             }
+            next_attempt_number += 1
             continue
 
         if et in _MARKERS:
