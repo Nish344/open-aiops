@@ -4,8 +4,9 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from open_aiops.core.config import ProviderConfig
 from open_aiops.governance.fallbacks import AllProvidersFailed, call_with_failover
-from open_aiops.governance.router import ModelRouter, ProviderConfig, RouteRequest
+from open_aiops.governance.router import ModelRouter, RouteRequest
 from open_aiops.providers.base import (
     Provider,
     ProviderRequest,
