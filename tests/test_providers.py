@@ -115,20 +115,15 @@ def test_base_provider_error_attributes():
 
 
 def test_rate_limit_error_flags_and_retry_after():
-    """Verify RateLimitError carries retryable and failover_eligible flags and retry_after delays."""
+    """Verify RateLimitError carries retryable and failover_eligible flags and retry_after_s delay."""
     err = RateLimitError(retry_after_s=15.0, provider="groq-fast")
     assert isinstance(err, ProviderError)
     assert err.retryable is True
     assert err.failover_eligible is True
     assert err.status_code == 429
     assert err.retry_after_s == 15.0
-    assert err.retry_after == 15.0
     assert err.provider == "groq-fast"
-
-    # Backward compatibility with retry_after argument name
-    err_compat = RateLimitError(retry_after=5.5)
-    assert err_compat.retry_after == 5.5
-    assert err_compat.retry_after_s == 5.5
+    assert not hasattr(err, "retry_after")
 
 
 def test_provider_timeout_flags():
@@ -256,3 +251,103 @@ def test_failover_integration_with_canonical_errors():
     with pytest.raises(BadRequest):
         asyncio.run(call_with_failover(router, req, caller_bad_request))
     assert calls_5 == ["primary"]
+
+
+# ---------------------------------------------------------------------------
+# Privacy and Sensitive Content Guarantees
+# ---------------------------------------------------------------------------
+
+
+def test_repr_and_str_never_include_message_content():
+    """Verify repr and str of requests, responses, and errors never leak message content."""
+    secret_prompt = "TOP_SECRET_PROMPT_PAYLOAD_9999"
+    secret_response = "TOP_SECRET_COMPLETION_OUTPUT_8888"
+
+    # 1. ProviderRequest never leaks prompt/message content
+    req = ProviderRequest(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "system instruction"},
+            {"role": "user", "content": secret_prompt},
+        ],
+        max_output_tokens=100,
+        temperature=0.5,
+    )
+    req_repr = repr(req)
+    req_str = str(req)
+    assert secret_prompt not in req_repr
+    assert secret_prompt not in req_str
+    assert "messages=" not in req_repr
+    assert "messages=" not in req_str
+
+    # 2. ProviderResponse never leaks completion text or raw response content
+    resp = ProviderResponse(
+        text=secret_response,
+        model="gpt-4o",
+        usage=Usage(input_tokens=10, output_tokens=20),
+        latency=0.15,
+        raw_response={"choices": [{"message": {"content": secret_response}}]},
+    )
+    resp_repr = repr(resp)
+    resp_str = str(resp)
+    assert secret_response not in resp_repr
+    assert secret_response not in resp_str
+    assert "text=" not in resp_repr
+    assert "text=" not in resp_str
+    assert "raw_response=" not in resp_repr
+    assert "raw_response=" not in resp_str
+
+    # 3. Canonical ProviderError hierarchy never includes message content
+    sample_errors = [
+        ProviderError(provider="test-p"),
+        RateLimitError(retry_after_s=12.5, provider="test-p"),
+        ProviderTimeout(provider="test-p"),
+        ProviderUnavailable(provider="test-p"),
+        AuthError(provider="test-p"),
+        BadRequest(provider="test-p"),
+    ]
+    for err in sample_errors:
+        err_repr = repr(err)
+        err_str = str(err)
+        assert secret_prompt not in err_repr
+        assert secret_prompt not in err_str
+        assert secret_response not in err_repr
+        assert secret_response not in err_str
+
+
+# ---------------------------------------------------------------------------
+# Test Helpers (FakeProvider)
+# ---------------------------------------------------------------------------
+
+
+def test_fake_provider_satisfies_protocol_and_records_calls():
+    """Verify FakeProvider satisfies Provider protocol and behaves predictably in tests."""
+    from tests.helpers.fake_provider import FakeProvider
+
+    fake = FakeProvider(default_text="hello from fake")
+    assert isinstance(fake, Provider)
+
+    req1 = ProviderRequest(model="test-model", messages=[{"role": "user", "content": "hi"}])
+    res1 = asyncio.run(fake.complete(req1))
+    assert res1.text == "hello from fake"
+    assert res1.model == "test-model"
+    assert fake.call_count == 1
+    assert len(fake.calls) == 1
+    assert fake.calls[0] is req1
+
+    # Scripted sequence of error then response
+    scripted_fake = FakeProvider(
+        responses=[
+            RateLimitError(retry_after_s=5.0, provider="fake"),
+            ProviderResponse(text="recovered", model="backup-model"),
+        ]
+    )
+    assert isinstance(scripted_fake, Provider)
+
+    req2 = ProviderRequest(model="backup-model")
+    with pytest.raises(RateLimitError):
+        asyncio.run(scripted_fake.complete(req2))
+
+    res2 = asyncio.run(scripted_fake.complete(req2))
+    assert res2.text == "recovered"
+    assert scripted_fake.call_count == 2

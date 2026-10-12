@@ -38,6 +38,16 @@ class ProviderError(Exception):
         ctx = f" (provider={self.provider})" if self.provider else ""
         return f"{self.message}{ctx}"
 
+    def __repr__(self) -> str:
+        parts = [f"message={self.message!r}"]
+        if self.provider:
+            parts.append(f"provider={self.provider!r}")
+        if self.status_code is not None:
+            parts.append(f"status_code={self.status_code}")
+        parts.append(f"retryable={self.retryable}")
+        parts.append(f"failover_eligible={self.failover_eligible}")
+        return f"{self.__class__.__name__}({', '.join(parts)})"
+
 
 class RateLimitError(ProviderError):
     """Raised when a provider rejects a request due to rate limiting (HTTP 429).
@@ -49,11 +59,9 @@ class RateLimitError(ProviderError):
         self,
         message: str = "Provider rate limit exceeded",
         *,
-        retry_after: float | None = None,
         retry_after_s: float | None = None,
         provider: str | None = None,
     ) -> None:
-        delay = retry_after_s if retry_after_s is not None else retry_after
         super().__init__(
             message=message,
             retryable=True,
@@ -61,8 +69,17 @@ class RateLimitError(ProviderError):
             provider=provider,
             status_code=429,
         )
-        self.retry_after_s = delay
-        self.retry_after = delay
+        self.retry_after_s = retry_after_s
+
+    def __repr__(self) -> str:
+        parts = [f"message={self.message!r}"]
+        if self.provider:
+            parts.append(f"provider={self.provider!r}")
+        if self.retry_after_s is not None:
+            parts.append(f"retry_after_s={self.retry_after_s}")
+        parts.append(f"retryable={self.retryable}")
+        parts.append(f"failover_eligible={self.failover_eligible}")
+        return f"{self.__class__.__name__}({', '.join(parts)})"
 
 
 class ProviderTimeout(ProviderError):

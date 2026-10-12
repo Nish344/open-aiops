@@ -23,7 +23,7 @@ from open_aiops.providers.errors import (
     RateLimitError,
 )
 
-# asyncio.TimeoutError is only an alias of TimeoutError from Python 3.11.
+# Kept for backward compatibility
 FAILOVER_ERRORS: tuple[type[BaseException], ...] = (
     RateLimitError,
     ProviderTimeout,
@@ -32,6 +32,18 @@ FAILOVER_ERRORS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
     ConnectionError,
 )
+
+
+def is_failover_eligible(exc: BaseException) -> bool:
+    """Determine whether an exception qualifies for automatic failover.
+
+    Decides based on the exception's explicit `failover_eligible` flag if present.
+    Standard network/timeout exceptions from the standard library qualify by default.
+    """
+    eligible = getattr(exc, "failover_eligible", None)
+    if eligible is not None:
+        return bool(eligible)
+    return isinstance(exc, (TimeoutError, ConnectionError))
 
 
 class AllProvidersFailed(NoProviderAvailable):
@@ -57,6 +69,9 @@ async def call_with_failover(
     for provider in decision.ranked:
         try:
             return await call(provider)
-        except FAILOVER_ERRORS as exc:
-            attempts.append((provider.name, type(exc).__name__))
+        except Exception as exc:
+            if is_failover_eligible(exc):
+                attempts.append((provider.name, type(exc).__name__))
+            else:
+                raise
     raise AllProvidersFailed(attempts)
