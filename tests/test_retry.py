@@ -14,6 +14,8 @@ from open_aiops.governance.retry import (
 
 
 class _Retryable(Exception):
+    """Local stand-in: uses retry_after_s= (INT-10 name) and an explicit flag."""
+
     def __init__(self, retry_after_s: float | None = None):
         super().__init__("retryable")
         self.retryable = True
@@ -43,9 +45,10 @@ def test_is_retryable_falls_back_to_legacy_errors():
     assert is_retryable(PermissionError()) is False
 
 
-def test_retry_after_reads_both_attribute_names():
-    assert retry_after_s(RateLimitError(retry_after=1.5)) == 1.5
+def test_retry_after_reads_retry_after_s_and_legacy_name():
     assert retry_after_s(_Retryable(retry_after_s=2.0)) == 2.0
+    # Current main RateLimitError still uses retry_after=; keep reading it.
+    assert retry_after_s(RateLimitError(retry_after=1.5)) == 1.5
     assert retry_after_s(TimeoutError()) is None
 
 
@@ -64,6 +67,18 @@ def test_compute_delay_honors_retry_after_over_jitter():
         rng=lambda: 0.0,
     )
     assert delay == 1.25
+
+
+def test_compute_delay_stops_when_retry_after_exceeds_cap():
+    assert (
+        compute_delay_s(
+            _Retryable(retry_after_s=3600.0),
+            0,
+            policy=RetryPolicy(base_delay_s=0.05, max_delay_s=2.0),
+            rng=lambda: 1.0,
+        )
+        is None
+    )
 
 
 def test_compute_delay_returns_none_when_past_deadline():
@@ -98,6 +113,7 @@ def test_success_on_first_try_does_not_sleep():
 def test_retries_then_succeeds_with_injected_backoff():
     calls = {"n": 0}
     sleeps: list[float] = []
+    hooks: list[tuple[int, float, str]] = []
 
     async def flaky():
         calls["n"] += 1
@@ -108,6 +124,9 @@ def test_retries_then_succeeds_with_injected_backoff():
     async def record_sleep(delay: float):
         sleeps.append(delay)
 
+    def on_retry(next_attempt: int, delay_s: float, error: BaseException) -> None:
+        hooks.append((next_attempt, delay_s, type(error).__name__))
+
     result = asyncio.run(
         call_with_retry(
             flaky,
@@ -115,11 +134,13 @@ def test_retries_then_succeeds_with_injected_backoff():
             sleep=record_sleep,
             rng=lambda: 1.0,
             clock=lambda: 0.0,
+            on_retry=on_retry,
         )
     )
     assert result == "done"
     assert calls["n"] == 3
     assert sleeps == [0.2, 0.4]
+    assert hooks == [(2, 0.2, "_Retryable"), (3, 0.4, "_Retryable")]
 
 
 def test_non_retryable_raises_immediately():
@@ -136,13 +157,13 @@ def test_non_retryable_raises_immediately():
 
 def test_exhausted_retries_reraises_last_error():
     async def always():
-        raise RateLimitError(retry_after=0.1)
+        raise _Retryable(retry_after_s=0.1)
 
-    with pytest.raises(RateLimitError):
+    with pytest.raises(_Retryable):
         asyncio.run(
             call_with_retry(
                 always,
-                policy=RetryPolicy(max_attempts=2, base_delay_s=0.0),
+                policy=RetryPolicy(max_attempts=2, base_delay_s=0.0, max_delay_s=2.0),
                 sleep=lambda _d: asyncio.sleep(0),
                 rng=lambda: 0.0,
                 clock=lambda: 0.0,
@@ -150,10 +171,33 @@ def test_exhausted_retries_reraises_last_error():
         )
 
 
+def test_retry_after_above_cap_reraises_without_sleeping():
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    async def always():
+        calls["n"] += 1
+        raise _Retryable(retry_after_s=3600.0)
+
+    async def record_sleep(delay: float):
+        sleeps.append(delay)
+
+    with pytest.raises(_Retryable):
+        asyncio.run(
+            call_with_retry(
+                always,
+                policy=RetryPolicy(max_attempts=5, base_delay_s=0.05, max_delay_s=2.0),
+                sleep=record_sleep,
+                rng=lambda: 1.0,
+                clock=lambda: 0.0,
+            )
+        )
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
 def test_deadline_stops_further_retries():
     calls = {"n": 0}
-    # clock: before first call 0.0; after failure before delay check 0.9;
-    # remaining 0.1 but jitter wants 0.5 -> None
     ticks = iter([0.0, 0.9])
 
     async def always():
@@ -171,4 +215,16 @@ def test_deadline_stops_further_retries():
                 rng=lambda: 1.0,
             )
         )
+    assert calls["n"] == 1
+
+
+def test_cancelled_error_passes_through_without_retry():
+    calls = {"n": 0}
+
+    async def cancelled():
+        calls["n"] += 1
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(call_with_retry(cancelled, policy=RetryPolicy(max_attempts=5)))
     assert calls["n"] == 1
