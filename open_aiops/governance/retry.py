@@ -22,8 +22,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
-from open_aiops.governance.fallbacks import RateLimitError
-
 T = TypeVar("T")
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -54,20 +52,14 @@ class RetryPolicy:
 def is_retryable(exc: BaseException) -> bool:
     """True if the same provider should be tried again.
 
-    Prefers an explicit ``retryable`` flag (provider errors from INT-10). Falls
-    back to the legacy failover error set until INT-10 lands on main.
+    Reads the explicit ``retryable`` flag on provider errors (INT-10). Exceptions
+    without the flag are not retried.
     """
-    flag = getattr(exc, "retryable", None)
-    if flag is not None:
-        return bool(flag)
-    return isinstance(
-        exc,
-        (RateLimitError, TimeoutError, asyncio.TimeoutError, ConnectionError),
-    )
+    return bool(getattr(exc, "retryable", False))
 
 
 def retry_after_s(exc: BaseException) -> float | None:
-    """Seconds suggested by the provider (``retry_after_s`` or ``retry_after``)."""
+    """Seconds suggested by the provider (``retry_after_s``, with legacy ``retry_after``)."""
     for attr in ("retry_after_s", "retry_after"):
         value = getattr(exc, attr, None)
         if value is not None:

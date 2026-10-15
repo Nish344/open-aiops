@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from open_aiops.governance.fallbacks import RateLimitError
+from open_aiops.providers.errors import RateLimitError
 from open_aiops.governance.retry import (
     RetryPolicy,
     call_with_retry,
@@ -14,12 +14,21 @@ from open_aiops.governance.retry import (
 
 
 class _Retryable(Exception):
-    """Local stand-in: uses retry_after_s= (INT-10 name) and an explicit flag."""
+    """Local stand-in with an explicit retryable flag."""
 
     def __init__(self, retry_after_s: float | None = None):
         super().__init__("retryable")
         self.retryable = True
         self.retry_after_s = retry_after_s
+
+
+class _LegacyRetryAfter(Exception):
+    """Covers the legacy ``retry_after`` attribute name without using RateLimitError."""
+
+    def __init__(self, retry_after: float):
+        super().__init__("legacy")
+        self.retryable = True
+        self.retry_after = retry_after
 
 
 class _Fatal(Exception):
@@ -33,22 +42,18 @@ def test_retry_policy_rejects_invalid_max_attempts():
         RetryPolicy(max_attempts=0)
 
 
-def test_is_retryable_prefers_explicit_flag():
+def test_is_retryable_reads_explicit_flag():
     assert is_retryable(_Retryable()) is True
-    assert is_retryable(_Fatal()) is False
-
-
-def test_is_retryable_falls_back_to_legacy_errors():
     assert is_retryable(RateLimitError()) is True
-    assert is_retryable(TimeoutError()) is True
-    assert is_retryable(ConnectionError()) is True
+    assert is_retryable(_Fatal()) is False
+    assert is_retryable(TimeoutError()) is False
     assert is_retryable(PermissionError()) is False
 
 
 def test_retry_after_reads_retry_after_s_and_legacy_name():
+    assert retry_after_s(RateLimitError(retry_after_s=1.5)) == 1.5
     assert retry_after_s(_Retryable(retry_after_s=2.0)) == 2.0
-    # Current main RateLimitError still uses retry_after=; keep reading it.
-    assert retry_after_s(RateLimitError(retry_after=1.5)) == 1.5
+    assert retry_after_s(_LegacyRetryAfter(retry_after=0.75)) == 0.75
     assert retry_after_s(TimeoutError()) is None
 
 
